@@ -1,0 +1,22 @@
+RENDER API
+----------
+Build Command:
+pip install -r backend/requirements.txt
+
+Start Command:
+cd backend && uvicorn app.main:app --host 0.0.0.0 --port $PORT
+
+Environment:
+DATABASE_URL = your PostgreSQL connection string
+JWT_SECRET = long random secret
+
+RENDER FRONTEND
+---------------
+Build Command:
+cd frontend && npm ci && npm run build
+
+Publish Directory:
+frontend/dist
+
+Environment:
+VITE_API_URL = https://YOUR-API.onrender.com
