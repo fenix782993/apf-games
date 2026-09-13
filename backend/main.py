@@ -1,14 +1,14 @@
 from typing import Optional
 from datetime import datetime, timezone
+from pathlib import Path
 
 from fastapi import FastAPI, Depends, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy.orm import Session
-from sqlalchemy import desc
-from pathlib import Path
-
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+
+from sqlalchemy.orm import Session
+from sqlalchemy import desc
 
 from app.db.session import engine, get_db, SessionLocal
 from app.models.models import (
@@ -29,6 +29,34 @@ from app.services.security import (
 )
 from app.services.game_service import record_result
 from app.core.config import OWNER_EMAIL, OWNER_PASSWORD
+
+
+# ============================================================
+# PATHS
+# ============================================================
+
+# Структура:
+#
+# project/
+# ├── backend/
+# │   ├── main.py
+# │   └── app/
+# └── frontend/
+#     ├── package.json
+#     └── dist/
+#         ├── index.html
+#         └── assets/
+#
+# main.py находится:
+# project/backend/main.py
+#
+# parent       -> project/backend
+# parent.parent -> project
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+FRONTEND_DIR = BASE_DIR / "frontend" / "dist"
+FRONTEND_ASSETS_DIR = FRONTEND_DIR / "assets"
 
 
 # ============================================================
@@ -60,6 +88,27 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ============================================================
+# FRONTEND STATIC FILES
+# ============================================================
+
+# Vite/React складывает JS/CSS/изображения сюда:
+#
+# frontend/dist/assets/
+#
+# Например:
+#
+# /assets/index-xxxxx.js
+# /assets/index-xxxxx.css
+
+if FRONTEND_ASSETS_DIR.exists():
+    app.mount(
+        "/assets",
+        StaticFiles(directory=str(FRONTEND_ASSETS_DIR)),
+        name="frontend-assets",
+    )
 
 
 # ============================================================
@@ -160,16 +209,39 @@ def public_user(user: User):
 
 
 # ============================================================
-# ROOT
+# ROOT — FRONTEND
 # ============================================================
 
 @app.get("/")
 def root():
+    """
+    Отдаём React/Vite frontend.
+
+    После:
+        npm run build
+
+    должен существовать:
+
+        frontend/dist/index.html
+    """
+
+    index_file = FRONTEND_DIR / "index.html"
+
+    if index_file.exists():
+        return FileResponse(
+            str(index_file),
+            media_type="text/html",
+        )
+
+    # Если frontend ещё не собран,
+    # показываем понятную информацию вместо непонятного 404.
+
     return {
         "service": "APF Games",
         "version": "1.0.0",
-        "status": "online",
-        "message": "APF Games API is running",
+        "status": "backend_online",
+        "message": "APF Games API is running, but frontend/dist/index.html was not found",
+        "frontend_path": str(index_file),
         "docs": "/docs",
         "health": "/api/health",
     }
@@ -919,3 +991,49 @@ def admin_audit(
         }
         for row in rows
     ]
+
+
+# ============================================================
+# FRONTEND SPA FALLBACK
+# ============================================================
+
+@app.get("/{full_path:path}")
+def frontend_fallback(full_path: str):
+    """
+    React Router fallback.
+
+    Например:
+
+        /
+        /games
+        /profile
+        /leaderboard
+        /admin
+
+    Если frontend существует, все эти страницы
+    получают index.html.
+
+    API здесь не перехватываем.
+    """
+
+    # API должен отдавать нормальный 404,
+    # если такого API-маршрута нет.
+
+    if full_path.startswith("api/"):
+        raise HTTPException(
+            status_code=404,
+            detail="Not Found",
+        )
+
+    index_file = FRONTEND_DIR / "index.html"
+
+    if index_file.exists():
+        return FileResponse(
+            str(index_file),
+            media_type="text/html",
+        )
+
+    raise HTTPException(
+        status_code=404,
+        detail="Frontend dist/index.html not found",
+    )
