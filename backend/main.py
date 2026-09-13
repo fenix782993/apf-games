@@ -1,179 +1,917 @@
-import os,secrets,hashlib,datetime as dt
-from enum import Enum
 from typing import Optional
-from fastapi import FastAPI,Depends,HTTPException,Header
+from datetime import datetime, timezone
+
+from fastapi import FastAPI, Depends, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel,Field
-from sqlalchemy import create_engine,String,Integer,Boolean,DateTime,Text,ForeignKey,Float
-from sqlalchemy.orm import DeclarativeBase,Mapped,mapped_column,Session
-from passlib.context import CryptContext
-from jose import jwt
+from sqlalchemy.orm import Session
+from sqlalchemy import desc
 
-DB=os.getenv("DATABASE_URL","sqlite:///./apg.db")
-if DB.startswith("postgres://"): DB=DB.replace("postgres://","postgresql://",1)
-engine=create_engine(DB,connect_args={"check_same_thread":False} if DB.startswith("sqlite") else {})
-pwd=CryptContext(schemes=["bcrypt"],deprecated="auto")
-SECRET=os.getenv("JWT_SECRET","apg-dev-secret")
-class Base(DeclarativeBase): pass
-class Role(str,Enum): CLIENT="CLIENT";SELLER="SELLER";OWNER="OWNER"
+from app.db.session import engine, get_db, SessionLocal
+from app.models.models import (
+    Base,
+    User,
+    GameResult,
+    Achievement,
+    DailyTask,
+    AuditLog,
+)
+from app.schemas.auth import RegisterIn, LoginIn
+from app.schemas.games import ResultIn, AchievementIn
+from app.services.security import (
+    hash_password,
+    verify_password,
+    make_token,
+    decode_token,
+)
+from app.services.game_service import record_result
+from app.core.config import OWNER_EMAIL, OWNER_PASSWORD
 
-class User(Base):
- __tablename__="users"
- id:Mapped[int]=mapped_column(primary_key=True);email:Mapped[str]=mapped_column(String(255),unique=True,index=True)
- password:Mapped[str]=mapped_column(String(255));name:Mapped[str]=mapped_column(String(120),default="APG User")
- phone:Mapped[str]=mapped_column(String(40),default="");avatar:Mapped[str]=mapped_column(String(500),default="")
- role:Mapped[str]=mapped_column(String(20),default="CLIENT");points:Mapped[int]=mapped_column(Integer,default=0);xp:Mapped[int]=mapped_column(Integer,default=0)
- created_at:Mapped[dt.datetime]=mapped_column(DateTime,default=dt.datetime.utcnow)
 
-class Partner(Base):
- __tablename__="partners"
- id:Mapped[int]=mapped_column(primary_key=True);owner_id:Mapped[int]=mapped_column(ForeignKey("users.id"))
- company:Mapped[str]=mapped_column(String(180));address:Mapped[str]=mapped_column(String(300),default="")
- phone:Mapped[str]=mapped_column(String(60),default="");website:Mapped[str]=mapped_column(String(300),default="")
- hours:Mapped[str]=mapped_column(String(200),default="");category:Mapped[str]=mapped_column(String(100),default="Авто")
- rating:Mapped[float]=mapped_column(Float,default=5);active:Mapped[bool]=mapped_column(Boolean,default=True)
+# ============================================================
+# DATABASE
+# ============================================================
 
-class Discount(Base):
- __tablename__="discounts"
- id:Mapped[int]=mapped_column(primary_key=True);seller_id:Mapped[int]=mapped_column(ForeignKey("users.id"))
- partner_id:Mapped[Optional[int]]=mapped_column(ForeignKey("partners.id"),nullable=True)
- title:Mapped[str]=mapped_column(String(180));description:Mapped[str]=mapped_column(Text,default="")
- image:Mapped[str]=mapped_column(String(500),default="");percent:Mapped[int]=mapped_column(Integer)
- expires_at:Mapped[Optional[dt.datetime]]=mapped_column(DateTime,nullable=True);address:Mapped[str]=mapped_column(String(300),default="")
- contacts:Mapped[str]=mapped_column(String(300),default="");enabled:Mapped[bool]=mapped_column(Boolean,default=True)
- status:Mapped[str]=mapped_column(String(20),default="PENDING");activations:Mapped[int]=mapped_column(Integer,default=0)
- created_at:Mapped[dt.datetime]=mapped_column(DateTime,default=dt.datetime.utcnow)
+Base.metadata.create_all(bind=engine)
 
-class Redemption(Base):
- __tablename__="redemptions"
- id:Mapped[int]=mapped_column(primary_key=True);discount_id:Mapped[int]=mapped_column(ForeignKey("discounts.id"));user_id:Mapped[int]=mapped_column(ForeignKey("users.id"))
- token_hash:Mapped[str]=mapped_column(String(128),unique=True);expires_at:Mapped[dt.datetime]=mapped_column(DateTime);used:Mapped[bool]=mapped_column(Boolean,default=False)
 
-class Car(Base):
- __tablename__="cars"
- id:Mapped[int]=mapped_column(primary_key=True);user_id:Mapped[int]=mapped_column(ForeignKey("users.id"))
- brand:Mapped[str]=mapped_column(String(80));model:Mapped[str]=mapped_column(String(100));year:Mapped[int]=mapped_column(Integer)
- vin:Mapped[str]=mapped_column(String(80),default="");mileage:Mapped[int]=mapped_column(Integer,default=0)
+# ============================================================
+# APPLICATION
+# ============================================================
 
-class GameResult(Base):
- __tablename__="game_results"
- id:Mapped[int]=mapped_column(primary_key=True);user_id:Mapped[int]=mapped_column(ForeignKey("users.id"))
- game:Mapped[str]=mapped_column(String(60));score:Mapped[int]=mapped_column(Integer);xp:Mapped[int]=mapped_column(Integer);points:Mapped[int]=mapped_column(Integer)
- created_at:Mapped[dt.datetime]=mapped_column(DateTime,default=dt.datetime.utcnow)
+app = FastAPI(
+    title="APF Games FULL",
+    version="1.0.0",
+    description="APF Games API",
+)
 
-Base.metadata.create_all(engine)
-app=FastAPI(title="APG V4 API")
-app.add_middleware(CORSMiddleware,allow_origins=["*"],allow_credentials=True,allow_methods=["*"],allow_headers=["*"])
 
-def db():
- with Session(engine) as s: yield s
-def out(u): return {"id":u.id,"email":u.email,"name":u.name,"phone":u.phone,"avatar":u.avatar,"role":u.role,"points":u.points,"xp":u.xp}
-def tok(u): return jwt.encode({"sub":str(u.id),"exp":dt.datetime.utcnow()+dt.timedelta(days=7)},SECRET,algorithm="HS256")
-def me(authorization:Optional[str]=Header(None),s:Session=Depends(db)):
- if not authorization: raise HTTPException(401,"Требуется авторизация")
- try: uid=int(jwt.decode(authorization.replace("Bearer ",""),SECRET,algorithms=["HS256"])["sub"])
- except: raise HTTPException(401,"Сессия истекла")
- u=s.get(User,uid)
- if not u: raise HTTPException(401,"Пользователь не найден")
- return u
+# ============================================================
+# CORS
+# ============================================================
 
-class Auth(BaseModel): email:str;password:str;name:str="APG User"
-class Offer(BaseModel):
- title:str;description:str="";percent:int=Field(ge=1,le=99);expires_at:Optional[dt.datetime]=None;address:str="";contacts:str="";image:str="";partner_id:Optional[int]=None;enabled:bool=True
-class CarIn(BaseModel): brand:str;model:str;year:int;vin:str="";mileage:int=0
-class Game(BaseModel): game:str;score:int=Field(ge=0,le=1000000)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-@app.get("/api/health")
-def health(): return {"status":"ok","service":"APG V4"}
 
-@app.post("/api/auth/register")
-def register(x:Auth,s:Session=Depends(db)):
- if s.query(User).filter_by(email=x.email.lower()).first(): raise HTTPException(400,"Email уже зарегистрирован")
- u=User(email=x.email.lower(),password=pwd.hash(x.password),name=x.name);s.add(u);s.commit();s.refresh(u)
- return {"token":tok(u),"user":out(u)}
-@app.post("/api/auth/login")
-def login(x:Auth,s:Session=Depends(db)):
- u=s.query(User).filter_by(email=x.email.lower()).first()
- if not u or not pwd.verify(x.password,u.password): raise HTTPException(401,"Неверный email или пароль")
- return {"token":tok(u),"user":out(u)}
-@app.get("/api/me")
-def getme(u=Depends(me)): return out(u)
-
-def dout(d): return {"id":d.id,"seller_id":d.seller_id,"partner_id":d.partner_id,"title":d.title,"description":d.description,"image":d.image,"percent":d.percent,"expires_at":d.expires_at.isoformat() if d.expires_at else None,"address":d.address,"contacts":d.contacts,"enabled":d.enabled,"status":d.status,"activations":d.activations}
-@app.get("/api/discounts")
-def list_discounts(s:Session=Depends(db)): return [dout(d) for d in s.query(Discount).filter_by(status="APPROVED",enabled=True).order_by(Discount.created_at.desc()).all()]
-@app.get("/api/my/discounts")
-def my_discounts(u=Depends(me),s:Session=Depends(db)):
- q=s.query(Discount) if u.role=="OWNER" else s.query(Discount).filter_by(seller_id=u.id)
- return [dout(d) for d in q.order_by(Discount.created_at.desc()).all()]
-@app.post("/api/discounts")
-def create(x:Offer,u=Depends(me),s:Session=Depends(db)):
- if u.role not in ("SELLER","OWNER"): raise HTTPException(403,"Недостаточно прав")
- d=Discount(**x.model_dump(),seller_id=u.id,status="APPROVED" if u.role=="OWNER" else "PENDING");s.add(d);s.commit();s.refresh(d);return dout(d)
-@app.delete("/api/discounts/{did}")
-def delete(did:int,u=Depends(me),s:Session=Depends(db)):
- d=s.get(Discount,did)
- if not d or (u.role!="OWNER" and d.seller_id!=u.id): raise HTTPException(404,"Скидка не найдена")
- s.delete(d);s.commit();return {"ok":True}
-@app.post("/api/discounts/{did}/qr")
-def qr(did:int,u=Depends(me),s:Session=Depends(db)):
- d=s.get(Discount,did)
- if not d or d.status!="APPROVED" or not d.enabled: raise HTTPException(404,"Скидка недоступна")
- raw=secrets.token_urlsafe(24);r=Redemption(discount_id=did,user_id=u.id,token_hash=hashlib.sha256(raw.encode()).hexdigest(),expires_at=dt.datetime.utcnow()+dt.timedelta(minutes=15))
- s.add(r);s.commit();return {"token":raw,"expires_at":r.expires_at.isoformat(),"discount":dout(d)}
-@app.post("/api/discounts/redeem")
-def redeem(data:dict,u=Depends(me),s:Session=Depends(db)):
- r=s.query(Redemption).filter_by(token_hash=hashlib.sha256(str(data.get("token","")).encode()).hexdigest()).first()
- if not r or r.used or r.expires_at<dt.datetime.utcnow() or r.user_id!=u.id: raise HTTPException(400,"QR недействителен")
- d=s.get(Discount,r.discount_id);r.used=True;d.activations+=1;s.commit();return {"ok":True}
-
-@app.get("/api/partners")
-def partners(s:Session=Depends(db)): return [{"id":p.id,"company":p.company,"address":p.address,"phone":p.phone,"website":p.website,"hours":p.hours,"category":p.category,"rating":p.rating} for p in s.query(Partner).filter_by(active=True).all()]
-
-@app.get("/api/cars")
-def cars(u=Depends(me),s:Session=Depends(db)): return [{"id":c.id,"brand":c.brand,"model":c.model,"year":c.year,"vin":c.vin,"mileage":c.mileage} for c in s.query(Car).filter_by(user_id=u.id).all()]
-@app.post("/api/cars")
-def addcar(x:CarIn,u=Depends(me),s:Session=Depends(db)):
- c=Car(user_id=u.id,**x.model_dump());s.add(c);s.commit();s.refresh(c);return {"id":c.id,**x.model_dump()}
-@app.delete("/api/cars/{cid}")
-def delcar(cid:int,u=Depends(me),s:Session=Depends(db)):
- c=s.get(Car,cid)
- if not c or c.user_id!=u.id: raise HTTPException(404,"Автомобиль не найден")
- s.delete(c);s.commit();return {"ok":True}
-
-@app.post("/api/games/result")
-def game(x:Game,u=Depends(me),s:Session=Depends(db)):
- xp=min(500,max(5,x.score//10));points=min(300,max(2,x.score//20))
- u.xp+=xp;u.points+=points;s.add(GameResult(user_id=u.id,game=x.game,score=x.score,xp=xp,points=points));s.commit()
- return {"score":x.score,"xp":xp,"points":points,"total_xp":u.xp,"total_points":u.points}
-@app.get("/api/games/leaderboard")
-def leaderboard(s:Session=Depends(db)):
- return [{"name":u.name,"points":u.points,"xp":u.xp} for u in s.query(User).order_by(User.points.desc()).limit(20).all()]
-
-@app.get("/api/owner/queue")
-def queue(u=Depends(me),s:Session=Depends(db)):
- if u.role!="OWNER": raise HTTPException(403,"Только OWNER")
- return [dout(d) for d in s.query(Discount).filter_by(status="PENDING").all()]
-@app.patch("/api/owner/discount/{did}/{action}")
-def moderate(did:int,action:str,u=Depends(me),s:Session=Depends(db)):
- if u.role!="OWNER": raise HTTPException(403,"Только OWNER")
- d=s.get(Discount,did)
- if not d: raise HTTPException(404,"Не найдено")
- if action not in ("approve","reject"): raise HTTPException(400,"Действие")
- d.status="APPROVED" if action=="approve" else "REJECTED";s.commit();return dout(d)
-@app.get("/api/owner/users")
-def users(u=Depends(me),s:Session=Depends(db)):
- if u.role!="OWNER": raise HTTPException(403,"Только OWNER")
- return [out(x) for x in s.query(User).all()]
-@app.patch("/api/owner/users/{uid}/role")
-def role(uid:int,role:str,u=Depends(me),s:Session=Depends(db)):
- if u.role!="OWNER" or role not in ("CLIENT","SELLER","OWNER"): raise HTTPException(403,"Недостаточно прав")
- x=s.get(User,uid)
- if not x: raise HTTPException(404,"Пользователь")
- x.role=role;s.commit();return out(x)
+# ============================================================
+# STARTUP
+# ============================================================
 
 @app.on_event("startup")
-def seed():
- with Session(engine) as s:
-  if not s.query(User).filter_by(email="owner@apg.local").first():
-   s.add(User(email="owner@apg.local",password=pwd.hash("owner123"),name="APG Owner",role="OWNER"));s.commit()
+def startup():
+    db = SessionLocal()
+
+    try:
+        owner = (
+            db.query(User)
+            .filter(User.email == OWNER_EMAIL.lower())
+            .first()
+        )
+
+        if owner is None:
+            owner = User(
+                email=OWNER_EMAIL.lower(),
+                password_hash=hash_password(OWNER_PASSWORD),
+                name="APF Owner",
+                role="OWNER",
+                xp=0,
+                points=0,
+                games_played=0,
+                best_score=0,
+            )
+
+            db.add(owner)
+            db.commit()
+
+    finally:
+        db.close()
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def get_current_user(
+    authorization: Optional[str],
+    db: Session,
+) -> User:
+
+    if not authorization:
+        raise HTTPException(
+            status_code=401,
+            detail="Требуется авторизация",
+        )
+
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=401,
+            detail="Неверный формат токена",
+        )
+
+    token = authorization[7:].strip()
+
+    if not token:
+        raise HTTPException(
+            status_code=401,
+            detail="Пустой токен",
+        )
+
+    try:
+        user_id = decode_token(token)
+
+    except ValueError:
+        raise HTTPException(
+            status_code=401,
+            detail="Сессия истекла или токен недействителен",
+        )
+
+    user = db.get(User, user_id)
+
+    if user is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Пользователь не найден",
+        )
+
+    return user
+
+
+def public_user(user: User):
+    return {
+        "id": user.id,
+        "email": user.email,
+        "name": user.name,
+        "role": user.role,
+        "xp": user.xp,
+        "points": user.points,
+        "games_played": user.games_played,
+        "best_score": user.best_score,
+        "level": (user.xp // 500) + 1,
+    }
+
+
+# ============================================================
+# ROOT
+# ============================================================
+
+@app.get("/")
+def root():
+    return {
+        "service": "APF Games",
+        "version": "1.0.0",
+        "status": "online",
+        "message": "APF Games API is running",
+        "docs": "/docs",
+        "health": "/api/health",
+    }
+
+
+# ============================================================
+# HEALTH
+# ============================================================
+
+@app.get("/api/health")
+def health():
+    return {
+        "status": "ok",
+        "service": "APF Games",
+        "version": "1.0.0",
+        "time": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# ============================================================
+# AUTH — REGISTER
+# ============================================================
+
+@app.post("/api/auth/register")
+def register(
+    data: RegisterIn,
+    db: Session = Depends(get_db),
+):
+    email = data.email.lower().strip()
+
+    existing = (
+        db.query(User)
+        .filter(User.email == email)
+        .first()
+    )
+
+    if existing:
+        raise HTTPException(
+            status_code=400,
+            detail="Email уже зарегистрирован",
+        )
+
+    name = data.name.strip()
+
+    if len(name) < 2:
+        raise HTTPException(
+            status_code=400,
+            detail="Имя должно содержать минимум 2 символа",
+        )
+
+    user = User(
+        email=email,
+        password_hash=hash_password(data.password),
+        name=name,
+        role="PLAYER",
+        xp=0,
+        points=0,
+        games_played=0,
+        best_score=0,
+    )
+
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+
+    return {
+        "token": make_token(user.id),
+        "user": public_user(user),
+    }
+
+
+# ============================================================
+# AUTH — LOGIN
+# ============================================================
+
+@app.post("/api/auth/login")
+def login(
+    data: LoginIn,
+    db: Session = Depends(get_db),
+):
+    email = data.email.lower().strip()
+
+    user = (
+        db.query(User)
+        .filter(User.email == email)
+        .first()
+    )
+
+    if user is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Неверный email или пароль",
+        )
+
+    if not verify_password(
+        data.password,
+        user.password_hash,
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Неверный email или пароль",
+        )
+
+    return {
+        "token": make_token(user.id),
+        "user": public_user(user),
+    }
+
+
+# ============================================================
+# CURRENT USER
+# ============================================================
+
+@app.get("/api/me")
+def me(
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    user = get_current_user(
+        authorization,
+        db,
+    )
+
+    return public_user(user)
+
+
+# ============================================================
+# GAMES LIST
+# ============================================================
+
+@app.get("/api/games")
+def games():
+
+    return [
+        {
+            "id": "race",
+            "name": "APF Race",
+            "description": (
+                "Разгоняй автомобиль, "
+                "контролируй скорость и набирай очки."
+            ),
+            "category": "arcade",
+        },
+        {
+            "id": "parking",
+            "name": "Perfect Parking",
+            "description": (
+                "Припаркуй автомобиль "
+                "максимально точно."
+            ),
+            "category": "skill",
+        },
+        {
+            "id": "quiz",
+            "name": "Auto Quiz",
+            "description": (
+                "Проверь знания автомобилей "
+                "и получи XP."
+            ),
+            "category": "quiz",
+        },
+        {
+            "id": "memory",
+            "name": "Auto Memory",
+            "description": (
+                "Найди все пары автомобилей "
+                "за минимальное количество ходов."
+            ),
+            "category": "puzzle",
+        },
+    ]
+
+
+# ============================================================
+# SAVE GAME RESULT
+# ============================================================
+
+@app.post("/api/games/result")
+def save_game_result(
+    data: ResultIn,
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+
+    user = get_current_user(
+        authorization,
+        db,
+    )
+
+    allowed_games = {
+        "race",
+        "parking",
+        "quiz",
+        "memory",
+    }
+
+    if data.game not in allowed_games:
+        raise HTTPException(
+            status_code=400,
+            detail="Неизвестная игра",
+        )
+
+    xp, points = record_result(
+        db=db,
+        user=user,
+        game=data.game,
+        score=data.score,
+        duration=data.duration,
+    )
+
+    return {
+        "ok": True,
+        "game": data.game,
+        "score": data.score,
+        "xp": xp,
+        "points": points,
+        "total_xp": user.xp,
+        "total_points": user.points,
+        "level": (user.xp // 500) + 1,
+    }
+
+
+# ============================================================
+# GAME HISTORY
+# ============================================================
+
+@app.get("/api/games/history")
+def game_history(
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+
+    user = get_current_user(
+        authorization,
+        db,
+    )
+
+    rows = (
+        db.query(GameResult)
+        .filter(GameResult.user_id == user.id)
+        .order_by(desc(GameResult.created_at))
+        .limit(100)
+        .all()
+    )
+
+    return [
+        {
+            "id": row.id,
+            "game": row.game,
+            "score": row.score,
+            "xp": row.xp,
+            "points": row.points,
+            "duration": row.duration,
+            "created_at": row.created_at.isoformat(),
+        }
+        for row in rows
+    ]
+
+
+# ============================================================
+# GAME LEADERBOARD
+# ============================================================
+
+@app.get("/api/games/leaderboard/{game}")
+def game_leaderboard(
+    game: str,
+    db: Session = Depends(get_db),
+):
+
+    allowed_games = {
+        "race",
+        "parking",
+        "quiz",
+        "memory",
+    }
+
+    if game not in allowed_games:
+        raise HTTPException(
+            status_code=400,
+            detail="Неизвестная игра",
+        )
+
+    rows = (
+        db.query(GameResult, User)
+        .join(
+            User,
+            User.id == GameResult.user_id,
+        )
+        .filter(GameResult.game == game)
+        .order_by(GameResult.score.desc())
+        .limit(50)
+        .all()
+    )
+
+    result = []
+
+    for index, (game_result, user) in enumerate(
+        rows,
+        start=1,
+    ):
+        result.append(
+            {
+                "rank": index,
+                "user_id": user.id,
+                "name": user.name,
+                "score": game_result.score,
+                "created_at": (
+                    game_result.created_at.isoformat()
+                ),
+            }
+        )
+
+    return result
+
+
+# ============================================================
+# GLOBAL LEADERBOARD
+# ============================================================
+
+@app.get("/api/leaderboard")
+def global_leaderboard(
+    db: Session = Depends(get_db),
+):
+
+    users = (
+        db.query(User)
+        .order_by(
+            User.xp.desc(),
+            User.points.desc(),
+        )
+        .limit(100)
+        .all()
+    )
+
+    return [
+        {
+            "rank": index,
+            "id": user.id,
+            "name": user.name,
+            "xp": user.xp,
+            "points": user.points,
+            "level": (user.xp // 500) + 1,
+            "games_played": user.games_played,
+            "best_score": user.best_score,
+        }
+        for index, user in enumerate(
+            users,
+            start=1,
+        )
+    ]
+
+
+# ============================================================
+# ACHIEVEMENTS — CREATE
+# ============================================================
+
+@app.post("/api/achievements")
+def add_achievement(
+    data: AchievementIn,
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+
+    user = get_current_user(
+        authorization,
+        db,
+    )
+
+    existing = (
+        db.query(Achievement)
+        .filter(
+            Achievement.user_id == user.id,
+            Achievement.code == data.code,
+        )
+        .first()
+    )
+
+    if existing:
+        return {
+            "ok": True,
+            "already_exists": True,
+        }
+
+    achievement = Achievement(
+        user_id=user.id,
+        code=data.code,
+        title=data.title,
+    )
+
+    db.add(achievement)
+    db.commit()
+
+    return {
+        "ok": True,
+        "already_exists": False,
+    }
+
+
+# ============================================================
+# ACHIEVEMENTS — LIST
+# ============================================================
+
+@app.get("/api/achievements")
+def achievements(
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+
+    user = get_current_user(
+        authorization,
+        db,
+    )
+
+    rows = (
+        db.query(Achievement)
+        .filter(
+            Achievement.user_id == user.id
+        )
+        .order_by(
+            desc(Achievement.created_at)
+        )
+        .all()
+    )
+
+    return [
+        {
+            "id": achievement.id,
+            "code": achievement.code,
+            "title": achievement.title,
+            "created_at": (
+                achievement.created_at.isoformat()
+            ),
+        }
+        for achievement in rows
+    ]
+
+
+# ============================================================
+# DAILY TASK
+# ============================================================
+
+@app.get("/api/tasks/daily")
+def daily_tasks(
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+
+    user = get_current_user(
+        authorization,
+        db,
+    )
+
+    today = (
+        datetime.now(timezone.utc)
+        .date()
+        .isoformat()
+    )
+
+    task = (
+        db.query(DailyTask)
+        .filter(
+            DailyTask.user_id == user.id,
+            DailyTask.task_date == today,
+            DailyTask.code == "play",
+        )
+        .first()
+    )
+
+    if task is None:
+
+        task = DailyTask(
+            user_id=user.id,
+            task_date=today,
+            code="play",
+            progress=0,
+            target=3,
+            claimed=False,
+        )
+
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+
+    return [
+        {
+            "id": task.id,
+            "code": task.code,
+            "progress": task.progress,
+            "target": task.target,
+            "claimed": task.claimed,
+            "reward_points": 100,
+        }
+    ]
+
+
+# ============================================================
+# CLAIM DAILY TASK
+# ============================================================
+
+@app.post("/api/tasks/daily/claim")
+def claim_daily_task(
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+
+    user = get_current_user(
+        authorization,
+        db,
+    )
+
+    today = (
+        datetime.now(timezone.utc)
+        .date()
+        .isoformat()
+    )
+
+    task = (
+        db.query(DailyTask)
+        .filter(
+            DailyTask.user_id == user.id,
+            DailyTask.task_date == today,
+            DailyTask.code == "play",
+        )
+        .first()
+    )
+
+    if task is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Ежедневное задание не найдено",
+        )
+
+    if task.progress < task.target:
+        raise HTTPException(
+            status_code=400,
+            detail="Задание ещё не выполнено",
+        )
+
+    if task.claimed:
+        raise HTTPException(
+            status_code=400,
+            detail="Награда уже получена",
+        )
+
+    task.claimed = True
+
+    user.points += 100
+
+    db.add(
+        AuditLog(
+            user_id=user.id,
+            action="daily_reward",
+            detail="Получено +100 APF Points",
+        )
+    )
+
+    db.commit()
+
+    return {
+        "ok": True,
+        "reward_points": 100,
+        "total_points": user.points,
+    }
+
+
+# ============================================================
+# ADMIN — USERS
+# ============================================================
+
+@app.get("/api/admin/users")
+def admin_users(
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+
+    owner = get_current_user(
+        authorization,
+        db,
+    )
+
+    if owner.role != "OWNER":
+        raise HTTPException(
+            status_code=403,
+            detail="Только владелец может использовать этот раздел",
+        )
+
+    users = (
+        db.query(User)
+        .order_by(User.id.desc())
+        .limit(500)
+        .all()
+    )
+
+    return [
+        public_user(user)
+        for user in users
+    ]
+
+
+# ============================================================
+# ADMIN — CHANGE ROLE
+# ============================================================
+
+@app.post("/api/admin/users/{user_id}/role/{role}")
+def change_user_role(
+    user_id: int,
+    role: str,
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+
+    owner = get_current_user(
+        authorization,
+        db,
+    )
+
+    if owner.role != "OWNER":
+        raise HTTPException(
+            status_code=403,
+            detail="Только владелец",
+        )
+
+    role = role.upper()
+
+    allowed_roles = {
+        "PLAYER",
+        "MODERATOR",
+        "OWNER",
+    }
+
+    if role not in allowed_roles:
+        raise HTTPException(
+            status_code=400,
+            detail="Недопустимая роль",
+        )
+
+    user = db.get(User, user_id)
+
+    if user is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Пользователь не найден",
+        )
+
+    old_role = user.role
+
+    user.role = role
+
+    db.add(
+        AuditLog(
+            user_id=owner.id,
+            action="role_change",
+            detail=(
+                f"user={user.id}; "
+                f"{old_role}->{role}"
+            ),
+        )
+    )
+
+    db.commit()
+    db.refresh(user)
+
+    return public_user(user)
+
+
+# ============================================================
+# ADMIN — USER STATS
+# ============================================================
+
+@app.get("/api/admin/stats")
+def admin_stats(
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+
+    owner = get_current_user(
+        authorization,
+        db,
+    )
+
+    if owner.role != "OWNER":
+        raise HTTPException(
+            status_code=403,
+            detail="Только владелец",
+        )
+
+    users_count = db.query(User).count()
+    games_count = db.query(GameResult).count()
+    achievements_count = db.query(Achievement).count()
+
+    total_points = sum(
+        value or 0
+        for (value,) in db.query(User.points).all()
+    )
+
+    total_xp = sum(
+        value or 0
+        for (value,) in db.query(User.xp).all()
+    )
+
+    return {
+        "users": users_count,
+        "games": games_count,
+        "achievements": achievements_count,
+        "total_points": total_points,
+        "total_xp": total_xp,
+    }
+
+
+# ============================================================
+# ADMIN — AUDIT LOG
+# ============================================================
+
+@app.get("/api/admin/audit")
+def admin_audit(
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+
+    owner = get_current_user(
+        authorization,
+        db,
+    )
+
+    if owner.role != "OWNER":
+        raise HTTPException(
+            status_code=403,
+            detail="Только владелец",
+        )
+
+    rows = (
+        db.query(AuditLog)
+        .order_by(desc(AuditLog.created_at))
+        .limit(200)
+        .all()
+    )
+
+    return [
+        {
+            "id": row.id,
+            "user_id": row.user_id,
+            "action": row.action,
+            "detail": row.detail,
+            "created_at": (
+                row.created_at.isoformat()
+            ),
+        }
+        for row in rows
+    ]
